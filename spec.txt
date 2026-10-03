@@ -1,0 +1,212 @@
+DESIGN DOCUMENT: tpt-actuarial (SCOPING DRAFT — status: needs-scoping)
+
+This is a scoping-stage draft. registry.toml's `status = "needs-scoping"` means
+the prior-art check below hasn't been completed. Do not treat this as ready to
+seed a real repo from; finish the PRIOR-ART CHECK first, then promote to
+`planned` and finalize the CRATE INVENTORY. Every crate: license = "MIT OR
+Apache-2.0". Apache-2.0-only is always disqualifying.
+
+BEFORE YOU WRITE ANYTHING BELOW: check tpt-rust-map/registry.toml's [[audit]]
+list for an existing tpt-solutions repo already covering this ground, and this
+repo's own registry.toml for the tpt-actuarial [[vertical]] entry this is
+scoping. Every primitive this vertical needs should already exist (or be
+flagged/planned) in a tpt-rust-map pillar — see tpt-vertical-map/spec.txt's
+CORE PRINCIPLES.
+
+PROJECT OVERVIEW
+tpt-actuarial is the product vertical for actuarial modeling and insurance
+reserving. The insurance and reinsurance industry runs its reserve calculations,
+pricing models, and regulatory capital requirements on R (lifecontingencies,
+ChainLadder, reserving package), Excel VBA macros, and $500k/seat proprietary
+software (SAS Prophet, Moody's RiskIntegrity, Willis Towers Watson Emblem).
+These workloads are: CPU-bound batch jobs (running thousands of stochastic
+scenarios overnight), compliance-sensitive (regulators review the methodology,
+not just the numbers), and require bit-identical reproducibility across runs
+and across systems (audit requirements for Solvency II and IFRS 17).
+
+Rust solves all three directly: multi-threaded stochastic scenario runs that
+finish in minutes instead of hours, deterministic output that satisfies audit
+requirements, and a single compiled binary that deploys to actuarial workstations
+without an R or Python installation. The regulatory forcing function is real and
+immediate: IFRS 17 (effective January 2023) and Solvency II are forcing insurers
+to rebuild their actuarial platforms to meet new disclosure requirements — they
+are already spending the money, and the incumbent tools are widely viewed as
+inadequate for the new standards.
+
+This vertical has no predecessor in tpt-solutions — nothing overlaps it.
+
+ECOSYSTEM SURVEY — license decisions
+Checked before scoping the crate inventory:
+
+  rslife — MIT. QUALIFIES.
+    Basic life-contingency math: annuity present values, insurance present
+    values, mortality table lookups. 4,646 downloads, released mid-2025.
+    Qualifies on license. However: the implementation is thin (single-decrement
+    life tables only, no select-and-ultimate, no multi-state models). Assess
+    whether to wrap rslife for the basic life-table primitives and build on
+    top, or absorb its functionality directly into tpt-actuarial-mortality.
+    Decision deferred to the prior-art check — read the source before deciding.
+
+  kestrel — license: needs-verification (0.0.1 stub with no documentation).
+    Investigate and discard if it remains a stub. Do not block on it.
+
+  polars — MIT. QUALIFIES.
+    DataFrame library. Loss triangles are naturally represented as 2D arrays
+    indexed by accident year and development year. polars qualifies and handles
+    this representation well. Assess whether tpt-actuarial-triangle should
+    depend on polars for its triangle storage or use ndarray (below) instead.
+
+  ndarray — MIT OR Apache-2.0. QUALIFIES.
+    N-dimensional arrays. Alternative to polars for triangle storage if a
+    pure-numeric 2D array is preferable to a DataFrame. Lower-level than
+    polars; better suited for the numeric core of chain ladder algorithms.
+    Likely the right choice for tpt-actuarial-triangle; polars better suited
+    for tpt-actuarial-pricing where tabular data with column names matters.
+
+  statrs — MIT OR Apache-2.0. QUALIFIES. Already wrapped by tpt-math-stats.
+    Distribution fitting for severity/frequency distributions. Consume via
+    tpt-math-stats / tpt-math-prob-dist, not directly.
+
+No serious crates for loss development triangles, stochastic reserving,
+Solvency II cash-flow projection, or IFRS 17 CSM roll-forward exist on
+crates.io. All domain-specific crates below are build-from-scratch.
+
+CORE PRINCIPLES
+This vertical is shaped like a financial-modeling platform: deterministic
+calculations that must be auditable, reproducible, and traceable to their
+inputs. Every calculation should be expressible as a pure function of typed
+inputs → typed outputs with no hidden state. The event-sourcing and audit-trail
+patterns from tpt-erp-rust apply here — audit before reimplementing.
+
+CRATE INVENTORY
+
+  tpt-actuarial-mortality
+    Build (possibly wrap rslife as a foundation — see ECOSYSTEM SURVEY).
+    Mortality tables and survival models: select-and-ultimate tables (two-
+    dimensional: select age × duration since selection), aggregate tables
+    (one-dimensional: attained age), fractional-age interpolation methods
+    (UDD — Uniform Distribution of Deaths, constant force, Balducci),
+    Gompertz–Makeham parametric mortality law fitting, improvement scales
+    (projection of future mortality improvement, e.g. Scale MP-2021 for US
+    pension), multi-state models (alive/disabled/dead, able/unable/dead for
+    long-term care). Life-contingency functions: curtate/complete future
+    lifetime, annuity present values (immediate, due, deferred, n-year certain
+    and life), insurance present values (term, whole life, endowment). no_std+alloc.
+    Depends on: tpt-math-prob-core (Distribution trait for mortality
+    distributions, survival function interface), tpt-math-prob-dist
+    (Gompertz, Makeham as parametric distributions), tpt-math-optimize-general
+    (MLE parameter fitting for Gompertz–Makeham), tpt-math-units (ages in
+    years, interest rates as dimensionless ratios — enforce at the type level
+    to prevent confusing force-of-mortality with annual effective rate).
+
+  tpt-actuarial-triangle
+    Build. Loss development triangles: the core data structure of P&C
+    (property/casualty) reserving. Accident-year × development-year matrix of
+    cumulative or incremental paid/incurred losses. Development factor selection
+    (volume-weighted, simple-average, selected LDF). Chain ladder method
+    (deterministic ultimate loss projection from selected link ratios). Bornhuetter-
+    Ferguson method (credibility-weighted blend of chain ladder and a priori
+    expected losses). Cape Cod method (a priori derived from the data itself).
+    Clark LDF and Cape Cod methods (maximum-likelihood with parametric growth
+    curves). Tail factor selection and extrapolation. no_std+alloc.
+    Depends on: tpt-eng-timeseries (accident year / calendar year / development
+    period time-series indexing), tpt-math-prob-core (MLE for Clark method
+    distribution fitting), tpt-math-optimize-general (MLE optimization for
+    Clark growth curve parameters). External: ndarray (triangle matrix storage).
+
+  tpt-actuarial-reserve
+    Build. Stochastic reserving: Mack chain ladder (distribution-free mean and
+    variance of ultimate losses, process and parameter variance decomposition),
+    Over-Dispersed Poisson (ODP) bootstrap (resample Pearson residuals to
+    generate predictive reserve distributions, England-Verrall method),
+    Merz-Wüthrich one-year reserve risk (calendar-year CDR — Claims
+    Development Result — for Solvency II SCR calculation). Reserve range
+    outputs: point estimate, standard error, VaR at 75th/95th/99.5th
+    percentile (Solvency II SCR = 99.5th percentile one-year reserve risk).
+    std (random sampling for bootstrap).
+    Depends on: tpt-actuarial-triangle (input data structure),
+    tpt-math-prob-monte-carlo (ODP bootstrap resampling engine),
+    tpt-math-prob-dist (overdispersed Poisson, log-normal for reserve
+    distributions), tpt-math-stats (chi-squared residual diagnostics).
+
+  tpt-actuarial-cashflow
+    Build. Regulatory cash-flow projection for IFRS 17 and Solvency II.
+    IFRS 17 Contractual Service Margin (CSM) roll-forward: fulfilment cash
+    flows (best-estimate liability), risk adjustment (RA), CSM accretion,
+    loss component tracking for onerous contracts. Solvency II Technical
+    Provisions: best-estimate liability (BEL) as probability-weighted present
+    value of future cash flows discounted on the EIOPA risk-free curve, risk
+    margin (cost-of-capital method: 6% × SCR(t) projected forward). Discount
+    curve construction: EIOPA Smith-Wilson extrapolation to the Ultimate Forward
+    Rate (UFR), UK/US Treasury curve bootstrapping. std.
+    Depends on: tpt-actuarial-mortality (mortality rates driving life insurance
+    cash flows), tpt-actuarial-reserve (reserve inputs for non-life BEL),
+    tpt-eng-timeseries (cash-flow projection vectors, discount factor time
+    series), tpt-math-optimize-general (Smith-Wilson calibration, yield curve
+    fitting), tpt-math-prob-monte-carlo (stochastic cash-flow scenario
+    generation for Internal Model BEL).
+    Open design call: IFRS 17 General Measurement Model (GMM), Variable Fee
+    Approach (VFA for with-profits/unit-linked), and Premium Allocation
+    Approach (PAA for short-duration contracts) are three distinct measurement
+    methods. Start with GMM (most general) and flag VFA and PAA as v2 scope.
+
+  tpt-actuarial-credibility
+    Build. Credibility theory: Bühlmann credibility (EBCT Model 1 — pure
+    experience rating), Bühlmann-Straub credibility (EBCT Model 2 — volume-
+    weighted experience rating), greatest-accuracy credibility (Bayesian
+    credibility with conjugate priors), limited fluctuation credibility (full/
+    partial credibility based on sample size thresholds). Used in commercial
+    lines pricing to blend class-level experience with manual rates. no_std+alloc.
+    Depends on: tpt-math-prob-core (prior/posterior conjugate pairs),
+    tpt-math-prob-bayes (Bayesian credibility update), tpt-math-stats
+    (variance/covariance estimation for Bühlmann parameters).
+
+  tpt-actuarial-pricing
+    Build. Insurance pricing and experience rating: GLM (Generalized Linear
+    Model) rating plan structure (multiplicative/additive rating factors,
+    base rate + relativities), loss ratio method, pure premium method,
+    indicated rate change calculation (loss development + trend + expense
+    loading), multivariate classification relativities via GBM (Gradient
+    Boosted Model) for personal lines. This is the pricing-actuarial workflow;
+    the underlying regression machinery comes from tpt-math-stats. std.
+    Depends on: tpt-actuarial-credibility (credibility-weighted experience),
+    tpt-actuarial-triangle (loss development to ultimate for pricing loss
+    ratios), tpt-math-stats (GLM fitting, regression diagnostics),
+    tpt-math-prob-dist (frequency and severity distribution fitting).
+    Open design call: whether GBM/ML-based relativities belong in this crate
+    or in a separate tpt-actuarial-ml crate — defer until a real pricing
+    consumer clarifies how much ML-based rating is needed vs. traditional GLM.
+
+  tpt-actuarial (umbrella)
+    Re-exports mortality + triangle + reserve + cashflow + credibility +
+    pricing behind Cargo features.
+    Depends on: all six crates above, each behind a named Cargo feature.
+
+BUILD ORDER
+tpt-actuarial-mortality -> tpt-actuarial-triangle -> tpt-actuarial-credibility ->
+tpt-actuarial-reserve -> tpt-actuarial-cashflow -> tpt-actuarial-pricing ->
+tpt-actuarial (umbrella).
+
+PRIOR-ART CHECK — NOT YET DONE, blocks promotion out of needs-scoping
+- tpt-erp-rust: audit its event-sourced financial ledger and audit-trail
+  patterns. A premium journal, policy-accounting system, or claims register
+  is shaped identically to a financial ledger — do not build that from scratch
+  if tpt-erp-rust already has the right shape.
+- rslife: read the source. If it implements select-and-ultimate tables and
+  multi-state models adequately, wrap it for tpt-actuarial-mortality's core.
+  If it only covers aggregate tables (the minimum viable implementation), treat
+  it as inspiration rather than a wrappable dependency.
+
+NOT IN SCOPE HERE
+Insurance product administration (policy administration, premium billing,
+claims workflow, policy management) — these are closer to tpt-erp-rust's
+event-sourced ledger shape than an actuarial modeling tool. Policy admin is
+a separate vertical (or tpt-erp-rust itself) — not here. Core probability
+distributions and statistical estimation belong in tpt-math-prob-core and
+tpt-math-stats respectively; if tpt-actuarial-mortality surfaces a distribution
+(e.g., Makeham) that other verticals would use, route it upstream.
+
+REPO CONVENTIONS
+Cargo workspace under crates/. Seed from tpt-vertical-map/template/. Every
+crate registered before implementation starts. All crates: license = "MIT OR
+Apache-2.0".
